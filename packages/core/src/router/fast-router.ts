@@ -1,6 +1,7 @@
 import type { ToolCallRequest } from '@lofly/types';
 import { parseCommand } from '../parser/command-parser.js';
 import { validateWhatsAppIntent } from '../parser/validator.js';
+import { extractMusicIntent } from '../parser/music-parser.js';
 
 /**
  * Fast Command Router — deterministic routing that bypasses the LLM entirely
@@ -54,6 +55,13 @@ const VOLUME_PATTERNS = [
 
 const PLAY_MUSIC_PATTERNS = [
   /^(?:coba\s+|tolong\s+|please\s+)?(?:putar|puter|setel|play|mainkan|nyalakan)\s+(?:lagu\s+|musik\s+|music\s+|song\s+)?(.+?)(?:\s+di\s+(?:spotify|apple\s+music))?(?:\s+dong|\s+ya|\s+deh)?\.?$/i,
+];
+
+const MEDIA_CONTROL_PATTERNS = [
+  /^(?:coba\s+|tolong\s+|please\s+)?(?:pause|berhentikan|jeda|stop)(?:\s+(?:lagu|musik|music|song))?\.?$/i,
+  /^(?:coba\s+|tolong\s+|please\s+)?(?:resume|lanjut|lanjutkan)(?:\s+(?:lagu|musik|music|song))?\.?$/i,
+  /^(?:coba\s+|tolong\s+|please\s+)?(?:skip|next|berikutnya|selanjutnya)(?:\s+(?:lagu|musik|music|song))?\.?$/i,
+  /^(?:coba\s+|tolong\s+|please\s+)?(?:previous|sebelumnya|kembali|prev)(?:\s+(?:lagu|musik|music|song))?\.?$/i,
 ];
 
 const SCREENSHOT_PATTERNS = [
@@ -147,10 +155,16 @@ export function fastRoute(transcript: string): FastRouteResult {
                 parameters: { appName: normalizeAppName(sub.app) },
               });
             } else if (sub.intent === 'play_music' && sub.query) {
+              const intent = extractMusicIntent(sub.query, 'play');
+              const params: any = { app: 'auto' };
+              if (intent.title) params.title = intent.title;
+              if (intent.artist) params.artist = intent.artist;
+              if (intent.query) params.query = intent.query;
+              
               calls.push({
                 id: `fast_sub_${Date.now()}_${i}`,
                 name: 'play_music',
-                parameters: { query: sub.query, app: 'auto' },
+                parameters: params,
               });
             }
           }
@@ -336,15 +350,62 @@ function matchSingleDeterministicCommand(input: string, indexOffset: number = 0)
   for (const pattern of PLAY_MUSIC_PATTERNS) {
     const m = input.match(pattern);
     if (m) {
-      const query = m[1].trim();
-      if (query.length >= 2) {
+      const rawQuery = m[1].trim();
+      if (rawQuery.length >= 2) {
+        console.log(`\n========================================`);
+        console.log(`[MUSIC_INPUT]`);
+        console.log(`"${rawQuery}"`);
+        const intent = extractMusicIntent(rawQuery, 'play');
+        console.log(`[MUSIC_TOOL_INPUT]`);
+        console.log(`title = ${intent.title || 'none'}\nartist = ${intent.artist || 'none'}\nquery = ${intent.query || rawQuery}`);
+        console.log(`========================================\n`);
+
+        const params: any = { app: 'auto' };
+        if (intent.title) params.title = intent.title;
+        if (intent.artist) params.artist = intent.artist;
+        if (intent.query) params.query = intent.query;
+
+        const confirmText = intent.title && intent.artist ? `✓ Playing ${intent.title} — ${intent.artist}` 
+                          : intent.title ? `✓ Playing ${intent.title}`
+                          : `✓ Playing ${rawQuery}`;
+
         return {
           matched: true,
-          toolCalls: [{ id: `fast_music_${Date.now()}_${indexOffset}`, name: 'play_music', parameters: { query, app: 'auto' } }],
-          confirmText: `✓ Playing ${query}`,
+          toolCalls: [{ id: `fast_music_${Date.now()}_${indexOffset}`, name: 'play_music', parameters: params }],
+          confirmText,
         };
       }
     }
+  }
+
+  // ── DD. Media Controls ──
+  if (MEDIA_CONTROL_PATTERNS[0].test(input)) {
+    return {
+      matched: true,
+      toolCalls: [{ id: `fast_mc_${Date.now()}_${indexOffset}`, name: 'play_music', parameters: { action: 'pause' } }],
+      confirmText: '✓ Pausing music',
+    };
+  }
+  if (MEDIA_CONTROL_PATTERNS[1].test(input)) {
+    return {
+      matched: true,
+      toolCalls: [{ id: `fast_mc_${Date.now()}_${indexOffset}`, name: 'play_music', parameters: { action: 'resume' } }],
+      confirmText: '✓ Resuming music',
+    };
+  }
+  if (MEDIA_CONTROL_PATTERNS[2].test(input)) {
+    return {
+      matched: true,
+      toolCalls: [{ id: `fast_mc_${Date.now()}_${indexOffset}`, name: 'play_music', parameters: { action: 'skip' } }],
+      confirmText: '✓ Skipping track',
+    };
+  }
+  if (MEDIA_CONTROL_PATTERNS[3].test(input)) {
+    return {
+      matched: true,
+      toolCalls: [{ id: `fast_mc_${Date.now()}_${indexOffset}`, name: 'play_music', parameters: { action: 'previous' } }],
+      confirmText: '✓ Previous track',
+    };
   }
 
   // ── E. Screenshot ──

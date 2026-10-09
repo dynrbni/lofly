@@ -7,7 +7,10 @@ import { toolSafety } from '../safety/policy.js';
 const execFileAsync = promisify(execFile);
 
 export interface PlayMusicParams {
-  query: string;
+  action?: 'play' | 'pause' | 'resume' | 'skip' | 'previous' | 'search';
+  title?: string;
+  artist?: string;
+  query?: string;
   app?: 'auto' | 'music' | 'spotify';
 }
 
@@ -16,7 +19,7 @@ export interface PlayMusicResultData {
   query: string;
   trackName?: string;
   artistName?: string;
-  action: 'playing_library' | 'playing_catalog' | 'catalog_search' | 'spotify_app' | 'spotify_web';
+  action: 'playing_library' | 'playing_catalog' | 'catalog_search' | 'spotify_app' | 'spotify_web' | 'media_control';
   message: string;
 }
 
@@ -45,21 +48,75 @@ async function isSpotifyInstalled(): Promise<boolean> {
 /**
  * Searches Apple Music catalog via official iTunes Search API.
  */
-async function searchAppleMusicCatalog(query: string): Promise<{ trackName: string; artistName: string; trackUrl: string } | null> {
+async function searchAppleMusicCatalog(params: PlayMusicParams): Promise<{ trackName: string; artistName: string; trackUrl: string } | null> {
+  const { title, artist, query } = params;
+  let term = '';
+  
+  if (title && artist) {
+    term = `${title} ${artist}`;
+  } else if (title) {
+    term = title;
+  } else if (query) {
+    term = query;
+  } else if (artist) {
+    term = artist;
+  }
+
+  if (!term) return null;
+
   try {
-    const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=1`;
+    const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&entity=song&limit=10`;
     const res = await fetch(apiUrl, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) return null;
     const data = await res.json() as { results?: Array<{ trackName?: string; artistName?: string; trackViewUrl?: string }> };
-    const first = data.results?.[0];
+    
+    if (!data.results || data.results.length === 0) return null;
+
+    // Rank results
+    const { rankMusicResults } = await import('./music-helpers.js');
+    const ranked = rankMusicResults(data.results, title, artist, query);
+    const first = ranked[0];
+
     if (first && first.trackViewUrl) {
+      // If we asked for a specific artist, ensure the result matches reasonably well,
+      // otherwise we might have fetched a completely wrong song.
+      if (artist) {
+        // rankMusicResults ensures higher score for matching artist
+        if (first._score < 5) { // Arbitrary threshold, meaning neither title nor artist matched well
+          return null; // Don't silently play unrelated track
+        }
+      }
+
       return {
-        trackName: first.trackName || query,
+        trackName: first.trackName || term,
         artistName: first.artistName || '',
         trackUrl: first.trackViewUrl,
       };
     }
   } catch {}
+  
+  // Fallback to query only if strict search failed
+  if (title && artist) {
+    try {
+      const fallbackTerm = term;
+      const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(fallbackTerm)}&entity=song&limit=5`;
+      const res = await fetch(apiUrl, { signal: AbortSignal.timeout(3000) });
+      if (res.ok) {
+        const data = await res.json() as { results?: Array<{ trackName?: string; artistName?: string; trackViewUrl?: string }> };
+        if (data.results && data.results.length > 0) {
+           const first = data.results[0];
+           if (first && first.trackViewUrl) {
+             return {
+               trackName: first.trackName || term,
+               artistName: first.artistName || '',
+               trackUrl: first.trackViewUrl,
+             };
+           }
+        }
+      }
+    } catch {}
+  }
+  
   return null;
 }
 
@@ -72,9 +129,22 @@ export const playMusicTool: ToolDefinition<PlayMusicParams, PlayMusicResultData>
   parameters: {
     type: 'object',
     properties: {
+      action: {
+        type: 'string',
+        enum: ['play', 'pause', 'resume', 'skip', 'previous', 'search'],
+        description: 'The media control action to perform. Defaults to play.',
+      },
+      title: {
+        type: 'string',
+        description: 'The song title.',
+      },
+      artist: {
+        type: 'string',
+        description: 'The artist name.',
+      },
       query: {
         type: 'string',
-        description: 'The song title, artist, or keywords to search and play (e.g. "The Weeknd Starboy", "Bohemian Rhapsody", "Tulus").',
+        description: 'The raw query if title/artist cannot be extracted cleanly.',
       },
       app: {
         type: 'string',
@@ -82,15 +152,18 @@ export const playMusicTool: ToolDefinition<PlayMusicParams, PlayMusicResultData>
         description: 'Target music player ("music" for Apple Music, "spotify" for Spotify, or "auto" to automatically pick). Default: "auto".',
       },
     },
-    required: ['query'],
+    required: [],
   },
   validate(params: unknown) {
     if (!params || typeof params !== 'object') {
       return { valid: false, error: 'Parameters must be an object' };
     }
     const p = params as Record<string, unknown>;
-    if (!p.query || typeof p.query !== 'string' || !p.query.trim()) {
-      return { valid: false, error: 'query is required and must be a non-empty string' };
+    if (p.action && ['pause', 'resume', 'skip', 'previous'].includes(p.action as string)) {
+      return { valid: true };
+    }
+    if (!p.query && !p.title && !p.artist) {
+      return { valid: false, error: 'Either query, title, or artist is required for searching/playing' };
     }
     return { valid: true };
   },
@@ -98,8 +171,34 @@ export const playMusicTool: ToolDefinition<PlayMusicParams, PlayMusicResultData>
     params: PlayMusicParams,
     context: ToolExecutionContext
   ): Promise<ToolResult<PlayMusicResultData>> {
-    const query = params.query.trim();
     let targetApp = params.app || 'auto';
+    const action = params.action || 'play';
+    
+    if (['pause', 'resume', 'skip', 'previous'].includes(action)) {
+      try {
+        let script = '';
+        if (action === 'pause') script = 'tell application "Music" to pause';
+        if (action === 'resume') script = 'tell application "Music" to play';
+        if (action === 'skip') script = 'tell application "Music" to next track';
+        if (action === 'previous') script = 'tell application "Music" to previous track';
+        
+        await execFileAsync('osascript', ['-e', script]);
+        return {
+          success: true,
+          data: {
+            app: 'Apple Music',
+            query: action,
+            action: 'media_control',
+            message: `Media control: ${action} executed.`,
+          }
+        };
+      } catch (err) {
+        return { success: false, error: `Gagal menjalankan kontrol media: ${err}` };
+      }
+    }
+
+    const rawQuery = params.query || (params.title && params.artist ? `${params.title} ${params.artist}` : params.title || params.artist || '');
+    const query = rawQuery.trim();
 
     // Auto-detect target based on user keywords if set to auto
     if (targetApp === 'auto') {
@@ -122,10 +221,19 @@ export const playMusicTool: ToolDefinition<PlayMusicParams, PlayMusicResultData>
     // 1. SPOTIFY HANDLING
     if (targetApp === 'spotify') {
       const hasSpotify = await isSpotifyInstalled();
+      
+      let spotifyQuery = cleanQuery;
+      if (params.title && params.artist) {
+        spotifyQuery = `track:${params.title} artist:${params.artist}`;
+      } else if (params.artist) {
+        spotifyQuery = `artist:${params.artist}`;
+      } else if (params.title) {
+        spotifyQuery = `track:${params.title}`;
+      }
 
       if (hasSpotify) {
         try {
-          await execFileAsync('open', [`spotify:search:${encodeURIComponent(cleanQuery)}`]);
+          await execFileAsync('open', [`spotify:search:${encodeURIComponent(spotifyQuery)}`]);
           // Short delay then send play command
           await new Promise((r) => setTimeout(r, 400));
           try {
@@ -136,7 +244,7 @@ export const playMusicTool: ToolDefinition<PlayMusicParams, PlayMusicResultData>
             success: true,
             data: {
               app: 'Spotify',
-              query: cleanQuery,
+              query: spotifyQuery,
               action: 'spotify_app',
               message: `Membuka dan memutar "${cleanQuery}" di aplikasi Spotify.`,
             },
@@ -205,7 +313,7 @@ export const playMusicTool: ToolDefinition<PlayMusicParams, PlayMusicResultData>
     }
 
     // Step B: Search catalog via iTunes Search API to get exact track deep link
-    const catalogMatch = await searchAppleMusicCatalog(cleanQuery);
+    const catalogMatch = await searchAppleMusicCatalog({ ...params, query: cleanQuery });
     if (catalogMatch && catalogMatch.trackUrl) {
       try {
         // 1. Pause any currently playing track first so player does not resume previous song
