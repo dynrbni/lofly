@@ -133,12 +133,18 @@ export class NineRouterProvider implements LLMProvider {
                 if (!toolCallAccumulator[idx]) {
                   toolCallAccumulator[idx] = {
                     id: tc.id || `call_${Date.now()}_${idx}`,
-                    name: tc.function?.name || '',
+                    name: '',
                     args: '',
                   };
                 }
                 if (tc.id) toolCallAccumulator[idx].id = tc.id;
-                if (tc.function?.name) toolCallAccumulator[idx].name += tc.function.name;
+                if (tc.function?.name) {
+                  if (!toolCallAccumulator[idx].name) {
+                    toolCallAccumulator[idx].name = tc.function.name;
+                  } else if (!toolCallAccumulator[idx].name.includes(tc.function.name)) {
+                    toolCallAccumulator[idx].name += tc.function.name;
+                  }
+                }
                 if (tc.function?.arguments) toolCallAccumulator[idx].args += tc.function.arguments;
               }
             }
