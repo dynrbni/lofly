@@ -301,6 +301,7 @@ export interface AgentStep {
 
 export interface AgentRunOptions {
   requestId?: string;
+  voiceSessionId?: string;
   maxSteps?: number;
   temperature?: number;
   context?: Record<string, unknown>;
@@ -315,6 +316,8 @@ export interface AgentRunResult {
   steps: AgentStep[];
   completed: boolean;
   error?: string;
+  rawTranscript?: string;
+  normalizedTranscript?: string;
 }
 
 // ============================================================================

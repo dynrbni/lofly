@@ -23,6 +23,10 @@ public final class AppState: ObservableObject {
     @Published public var lastResponse: String = ""
     @Published public var liveTranscript: String = ""
     @Published public var inputText: String = ""
+    @Published public var finalUserInput: String = ""
+    @Published public var rawTranscript: String = ""
+    @Published public var normalizedTranscript: String = ""
+    @Published public var currentVoiceSessionId: String? = nil
     @Published public var pendingConfirmation: ConfirmationRequest? = nil
     @Published public var isOverlayVisible = false
     @Published public var isVisibleOnScreen = false
@@ -176,21 +180,45 @@ public final class AppState: ObservableObject {
             }
             .store(in: &cancellables)
 
-        speechRecognizer.onTranscriptFinalized = { [weak self] finalTranscript in
+        speechRecognizer.onTranscriptFinalized = { [weak self] finalTranscript, sessionId in
             guard let self = self else { return }
             guard !self.speechRecognizer.isInAppDictation else { return }
+
+            print("\n========================================")
+            print("[VOICE]")
+            print("audio session id: \(sessionId)")
+            print("\n[STT_RAW]")
+            print("\"\(finalTranscript)\"")
+            print("\n[STT_FINAL]")
+            print("\"\(finalTranscript)\"")
+
+            // Strict session isolation: ignore any result that does not match active voice session
+            guard let activeId = self.currentVoiceSessionId, sessionId == activeId else {
+                print("[AppState] Discarding stale transcript from session \(sessionId) (current active: \(self.currentVoiceSessionId ?? "none"))")
+                return
+            }
+
             let query = finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !query.isEmpty else { return }
-            print("[AppState] Speech recognized: \"\(query)\". Submitting query...")
+
+            self.rawTranscript = query
+            self.finalUserInput = query
             self.liveTranscript = query
             self.inputText = query
+            print("\n[TRANSCRIPT_STATE]")
+            print("\"\(query)\"")
+            print("========================================\n")
 
-            self.sendQuery(text: query)
+            self.sendQuery(text: query, voiceSessionId: sessionId)
         }
 
-        speechRecognizer.onAudioRecorded = { [weak self] audioURL in
+        speechRecognizer.onAudioRecorded = { [weak self] audioURL, sessionId in
             guard let self = self else { return }
-            print("[AppState] Sending recorded voice audio to agent runtime...")
+            guard let activeId = self.currentVoiceSessionId, sessionId == activeId else {
+                print("[AppState] Discarding stale audio recording from session \(sessionId)")
+                return
+            }
+            print("[AppState] Sending recorded voice audio to agent runtime (session: \(sessionId))...")
             self.autoDismissWorkItem?.cancel()
             self.state = .thinking
             self.client.sendAudioFile(url: audioURL) { [weak self] result in
@@ -198,8 +226,6 @@ public final class AppState: ObservableObject {
                 case .success(let res):
                     self?.lastResponse = res.text
                     self?.state = .idle
-                    // The desktop mirrors the answer inline; /audio is voice
-                    // so the server never persisted it to chat history.
                     if DesktopWindowController.shared.isVisible {
                         DesktopStore.shared.finishVoiceSession(response: res.text, error: res.error)
                     }
@@ -299,7 +325,7 @@ public final class AppState: ObservableObject {
         guard state == .listening else { return }
 
         let transcript = speechRecognizer.liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if speechRecognizer.hasSpoken && !transcript.isEmpty {
+        if speechRecognizer.hasSpoken || !transcript.isEmpty {
             print("[AppState] Push-to-talk released with speech (\(transcript)). Submitting query...")
             // stopListening() finalises the transcript, which submits it.
             stopListening()
@@ -312,7 +338,11 @@ public final class AppState: ObservableObject {
     /// Tears down a capture without submitting anything.
     private func cancelPushToTalk() {
         speechRecognizer.cancelListening()
+        currentVoiceSessionId = nil
         state = .idle
+        finalUserInput = ""
+        rawTranscript = ""
+        normalizedTranscript = ""
         liveTranscript = ""
         inputText = ""
         errorMessage = nil
@@ -326,10 +356,19 @@ public final class AppState: ObservableObject {
         isOutputExpanded = false
         checkPermissions()
         state = .listening
+
+        let newSessionId = UUID().uuidString
+        currentVoiceSessionId = newSessionId
+
+        // Authoritative reset: never retain previous utterance state
+        finalUserInput = ""
+        rawTranscript = ""
+        normalizedTranscript = ""
         liveTranscript = ""
         inputText = ""
         errorMessage = nil
-        speechRecognizer.startListening()
+
+        speechRecognizer.startListening(sessionId: newSessionId)
         client.sendWake()
     }
 
@@ -338,10 +377,12 @@ public final class AppState: ObservableObject {
         speechRecognizer.stopListening()
     }
 
-    public func sendQuery(text: String) {
+    public func sendQuery(text: String, voiceSessionId: String? = nil) {
         autoDismissWorkItem?.cancel()
         state = .thinking
         lastResponse = ""
+        finalUserInput = text
+        rawTranscript = text
         liveTranscript = text
         inputText = text
         errorMessage = nil
@@ -350,7 +391,7 @@ public final class AppState: ObservableObject {
         // path — are marked as voice so the agent server keeps them out of
         // conversation history. Typed desktop input goes through
         // DesktopStore.send() with source text instead.
-        client.sendQuery(text: text, source: .voice) { [weak self] result in
+        client.sendQuery(text: text, source: .voice, voiceSessionId: voiceSessionId) { [weak self] result in
             switch result {
             case .success(let res):
                 self?.lastResponse = res.text

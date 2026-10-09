@@ -85,12 +85,16 @@ public struct AgentQueryResponse: Codable, Sendable {
     public let error: String?
     public let taskId: String?
     public let conversationId: String?
+    public let rawTranscript: String?
+    public let normalizedTranscript: String?
 
-    public init(text: String, completed: Bool, error: String? = nil, taskId: String? = nil, conversationId: String? = nil) {
+    public init(text: String, completed: Bool, error: String? = nil, taskId: String? = nil, conversationId: String? = nil, rawTranscript: String? = nil, normalizedTranscript: String? = nil) {
         self.text = text
         self.completed = completed
         self.error = error
         self.taskId = taskId
         self.conversationId = conversationId
+        self.rawTranscript = rawTranscript
+        self.normalizedTranscript = normalizedTranscript
     }
 }

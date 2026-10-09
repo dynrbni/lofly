@@ -682,7 +682,8 @@ public final class DesktopStore: ObservableObject {
     /// open: the notch stays hidden and this surface takes over.
     func beginVoiceSession() {
         activeSurface = .chat
-        voiceSession = VoiceSession(transcript: liveTranscript)
+        liveTranscript = ""
+        voiceSession = VoiceSession(transcript: "")
     }
 
     /// Live transcript while the mic is open.

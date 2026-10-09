@@ -197,6 +197,7 @@ public final class AgentClient: ObservableObject {
         reasoningLevel: String = "medium",
         attachments: [String] = [],
         conversationId: String? = nil,
+        voiceSessionId: String? = nil,
         completion: @escaping (Result<AgentQueryResponse, Error>) -> Void
     ) {
         let endpoint = baseURL.appendingPathComponent("query")
@@ -212,6 +213,9 @@ public final class AgentClient: ObservableObject {
         ]
         if let conversationId = conversationId, !conversationId.isEmpty {
             payload["conversationId"] = conversationId
+        }
+        if let voiceSessionId = voiceSessionId, !voiceSessionId.isEmpty {
+            payload["voiceSessionId"] = voiceSessionId
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
 

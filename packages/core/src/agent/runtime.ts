@@ -81,7 +81,7 @@ export class AgentRuntime {
   }
 
   public getModelName(): string {
-    return (this.llmProvider as unknown as { model?: string }).model || 'ag/gemini-3.8-flash-high';
+    return (this.llmProvider as unknown as { model?: string })?.model || 'ag/gemini-3.8-flash-high';
   }
 
   public resetConversation(): void {
@@ -196,6 +196,16 @@ export class AgentRuntime {
    */
   public async handleTranscript(transcript: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
     const rawTrimmed = (transcript || '').trim();
+    const sessionId = options.voiceSessionId || options.requestId || `voice_${Date.now()}`;
+
+    console.log(`\n========================================`);
+    console.log(`[VOICE]`);
+    console.log(`audio session id: ${sessionId}`);
+    console.log(`\n[STT_RAW]`);
+    console.log(`"${rawTrimmed}"`);
+    console.log(`\n[STT_FINAL]`);
+    console.log(`"${rawTrimmed}"`);
+
     if (!rawTrimmed) {
       this.logger.warn('handleTranscript received empty transcript');
       return {
@@ -203,12 +213,21 @@ export class AgentRuntime {
         steps: [],
         completed: false,
         error: 'empty transcript',
+        rawTranscript: '',
+        normalizedTranscript: '',
       };
     }
 
     const processed = processTranscript(transcript);
 
+    console.log(`\n[NORMALIZED]`);
+    console.log(`"${processed.normalizedTranscript}"`);
+    console.log(`\n[AGENT_INPUT]`);
+    console.log(`"${processed.normalizedTranscript}"`);
+    console.log(`========================================\n`);
+
     this.logger.info('Voice transcript processed', {
+      sessionId,
       rawTranscript: processed.rawTranscript,
       normalizedTranscript: processed.normalizedTranscript,
       confidence: processed.confidence,
@@ -229,6 +248,8 @@ export class AgentRuntime {
         steps: [],
         completed: false,
         error: `Transcript invalid: ${processed.validationReason}`,
+        rawTranscript: processed.rawTranscript,
+        normalizedTranscript: processed.normalizedTranscript,
       };
     }
 
@@ -240,13 +261,21 @@ export class AgentRuntime {
         text: 'Siap bos, perintah dibatalkan.',
         steps: [],
         completed: true,
+        rawTranscript: processed.rawTranscript,
+        normalizedTranscript: processed.normalizedTranscript,
       };
     }
 
-    return this.run(command, {
+    const runResult = await this.run(command, {
       ...options,
       requestId: options.requestId || `voice_${Date.now()}`,
     });
+
+    return {
+      ...runResult,
+      rawTranscript: processed.rawTranscript,
+      normalizedTranscript: processed.normalizedTranscript,
+    };
   }
 
   public async run(userInput: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {

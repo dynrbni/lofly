@@ -209,10 +209,16 @@ public struct FloatingOverlayView: View {
     }
 
     private var promptText: String {
+        if appState.state == .listening {
+            return appState.liveTranscript
+        }
+        if !appState.finalUserInput.isEmpty {
+            return appState.finalUserInput
+        }
         if !appState.liveTranscript.isEmpty {
             return appState.liveTranscript
         }
-        return appState.inputText
+        return ""
     }
 
     // Wing width adapts to layout mode
@@ -502,10 +508,18 @@ public struct FloatingOverlayView: View {
 
             // Prompt echo
             if !promptText.isEmpty {
-                Text("Prompt: \(promptText)")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(.white.opacity(0.45))
-                    .lineLimit(2)
+                VStack(alignment: .leading, spacing: 2) {
+                    if !appState.rawTranscript.isEmpty && !appState.normalizedTranscript.isEmpty && appState.rawTranscript != appState.normalizedTranscript {
+                        Text("Raw: \(appState.rawTranscript)")
+                            .font(.system(size: 9.5, weight: .regular))
+                            .foregroundColor(.white.opacity(0.35))
+                            .lineLimit(1)
+                    }
+                    Text("Prompt: \(promptText)")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.white.opacity(0.45))
+                        .lineLimit(2)
+                }
             }
 
             // Response body

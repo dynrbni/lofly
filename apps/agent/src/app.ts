@@ -529,6 +529,12 @@ export class LoflyAgentApp {
           ? body.conversationId.trim()
           : undefined;
 
+        const voiceSessionId = (typeof body.voiceSessionId === 'string' && body.voiceSessionId.trim().length > 0)
+          ? body.voiceSessionId.trim()
+          : (typeof body.sessionId === 'string' && body.sessionId.trim().length > 0)
+            ? body.sessionId.trim()
+            : undefined;
+
         const isStream = Boolean(body.stream) || req.headers.accept?.includes('text/event-stream');
         const requestId = `chat_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 
@@ -556,6 +562,7 @@ export class LoflyAgentApp {
                 reasoningLevel,
                 attachments,
                 conversationId: conversationIdParam,
+                voiceSessionId,
                 onChunk: (chunk: string) => {
                   if (!clientAborted) {
                     res.write(`data: ${JSON.stringify({ type: 'chunk', text: chunk, requestId })}\n\n`);
@@ -573,6 +580,8 @@ export class LoflyAgentApp {
                   conversationId,
                   error: result.error,
                   completed: result.completed,
+                  rawTranscript: result.rawTranscript,
+                  normalizedTranscript: result.normalizedTranscript,
                 })}\n\n`
               );
               res.end();
@@ -589,7 +598,7 @@ export class LoflyAgentApp {
         const { result, taskId, conversationId } = await this.runTracked(
           fullQuery,
           requestId,
-          { source, reasoningLevel, attachments, conversationId: conversationIdParam }
+          { source, reasoningLevel, attachments, conversationId: conversationIdParam, voiceSessionId }
         );
         sendJson(200, { ...result, taskId, conversationId });
       } catch (err) {
@@ -677,15 +686,35 @@ export class LoflyAgentApp {
         this.logger.info(`Audio transcribed to: "${transcript}"`);
         // Voice and text share one pipeline, so a spoken command is tracked as
         // a task — but it is voice, so it never lands in chat history.
+        const headerSessionId = req.headers['x-voice-session-id'] as string | undefined;
         const { result: agentResult, taskId } = await this.runTracked(
           transcript,
           `voice_${Date.now()}`,
-          { source: 'voice' }
+          { source: 'voice', voiceSessionId: headerSessionId }
         );
-        sendJson(200, { ...agentResult, taskId });
+        sendJson(200, {
+          ...agentResult,
+          taskId,
+          rawTranscript: agentResult.rawTranscript || transcript,
+          normalizedTranscript: agentResult.normalizedTranscript || transcript,
+        });
       } catch (err) {
         sendJson(500, { error: String(err) });
       }
+      return;
+    }
+
+    // 7b. GET /stt/config (STT configuration & shared vocabulary)
+    if (req.method === 'GET' && pathname === '/stt/config') {
+      sendJson(200, {
+        cloudProvider: this.config.stt.groqApiKey ? 'whisper' : null,
+        contextualStrings: [
+          'WhatsApp', 'Spotify', 'CapCut', 'VS Code', 'GitHub', 'Safari', 'Google Chrome',
+          'Word', 'Discord', 'Telegram', 'Terminal', 'Finder', 'Dimas', 'Backsy', 'buka',
+          'putar', 'chat', 'kirim pesan', 'lagu', 'playlist', 'Sabrina Carpenter', 'Manchild',
+          'manchild', 'Radiohead', 'Creep', 'Bruno Mars', 'Taylor Swift', 'Billie Eilish', 'Dongker'
+        ],
+      });
       return;
     }
 
@@ -1006,6 +1035,7 @@ export class LoflyAgentApp {
       reasoningLevel?: 'low' | 'medium' | 'high';
       attachments?: string[];
       conversationId?: string;
+      voiceSessionId?: string;
       onChunk?: (chunk: string) => void;
     } = {}
   ): Promise<{ result: AgentRunResult; conversationId: string | null; taskId: string }> {
@@ -1032,6 +1062,7 @@ export class LoflyAgentApp {
     try {
       const result = await this.runtime.handleTranscript(text, {
         requestId,
+        voiceSessionId: options.voiceSessionId,
         reasoningLevel: options.reasoningLevel,
         attachments: options.attachments,
         onChunk: options.onChunk,
