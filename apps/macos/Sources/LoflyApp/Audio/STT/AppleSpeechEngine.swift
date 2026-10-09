@@ -14,6 +14,9 @@ final class AppleSpeechEngine: StreamingSTTEngine, @unchecked Sendable {
     private let config: STTConfig
     private let lock = NSLock()
     private var sessions: [LocaleSession] = []
+    /// Diagnostics: one record per locale from the last `finishStream`,
+    /// including locales that errored or returned nothing.
+    private(set) var lastEngineRecords: [[String: Any]] = []
 
     /// Recognizers are reused across utterances; creating them is not free.
     private static let recognizerCache = Locked<[String: SFSpeechRecognizer]>([:])
@@ -62,7 +65,8 @@ final class AppleSpeechEngine: StreamingSTTEngine, @unchecked Sendable {
             let request = SFSpeechAudioBufferRecognitionRequest()
             configure(request, recognizer: recognizer, options: options)
             let session = LocaleSession(locale: recognizer.locale.identifier, request: request,
-                                        isPrimary: index == 0)
+                                        isPrimary: index == 0,
+                                        onDevice: request.requiresOnDeviceRecognition)
             session.task = recognizer.recognitionTask(with: request) { [weak session] result, error in
                 guard let session else { return }
                 if let result {
@@ -109,6 +113,8 @@ final class AppleSpeechEngine: StreamingSTTEngine, @unchecked Sendable {
             for await t in group { if let t { results.append(t) } }
         }
         current.forEach { $0.task?.cancel() }
+        let records = current.map { $0.diagnosticsRecord() }
+        lock.lock(); lastEngineRecords = records; lock.unlock()
         clearSessions()
 
         for t in results {
@@ -164,7 +170,8 @@ final class AppleSpeechEngine: StreamingSTTEngine, @unchecked Sendable {
         for (index, recognizer) in recognizers.enumerated() {
             let request = SFSpeechURLRecognitionRequest(url: wavFile)
             configure(request, recognizer: recognizer, options: options)
-            let session = LocaleSession(locale: recognizer.locale.identifier, request: nil, isPrimary: index == 0)
+            let session = LocaleSession(locale: recognizer.locale.identifier, request: nil, isPrimary: index == 0,
+                                        onDevice: request.requiresOnDeviceRecognition)
             session.task = recognizer.recognitionTask(with: request) { [weak session] result, error in
                 if let result { session?.update(result: result) }
                 if let error { session?.fail(error) }
@@ -193,17 +200,25 @@ private final class LocaleSession: @unchecked Sendable {
     let locale: String
     let request: SFSpeechAudioBufferRecognitionRequest!
     let isPrimary: Bool
+    let onDevice: Bool
     var task: SFSpeechRecognitionTask?
+
+    private enum Completion { case final, error, timeout }
 
     private let lock = NSLock()
     private var latest: SFSpeechRecognitionResult?
     private var finished = false
+    private var completion: Completion?
+    private var errorText: String?
+    private var waitStartedAt: DispatchTime?
+    private var completedAt: DispatchTime?
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(locale: String, request: SFSpeechAudioBufferRecognitionRequest?, isPrimary: Bool) {
+    init(locale: String, request: SFSpeechAudioBufferRecognitionRequest?, isPrimary: Bool, onDevice: Bool) {
         self.locale = locale
         self.request = request
         self.isPrimary = isPrimary
+        self.onDevice = onDevice
     }
 
     func update(result: SFSpeechRecognitionResult) {
@@ -211,23 +226,30 @@ private final class LocaleSession: @unchecked Sendable {
         latest = result
         let done = result.isFinal
         lock.unlock()
-        if done { complete() }
+        if done { complete(.final) }
     }
 
     func fail(_ error: Error) {
         let ns = error as NSError
         // 203/216/301 = cancelled/no-op, 1110 = no speech detected.
         let benign: Set<Int> = [203, 216, 301, 1110]
-        if !(ns.domain == "kAFAssistantErrorDomain" && benign.contains(ns.code)) {
+        let isBenign = ns.domain == "kAFAssistantErrorDomain" && benign.contains(ns.code)
+        if !isBenign {
             STTLog.error("Apple STT [\(locale)] error \(ns.domain)#\(ns.code): \(ns.localizedDescription)")
         }
-        complete()
+        lock.lock()
+        // 1110 ("no speech detected") is an outcome worth recording, cancellations are not.
+        if !isBenign || ns.code == 1110, errorText == nil { errorText = "\(ns.domain)#\(ns.code)" }
+        lock.unlock()
+        complete(.error)
     }
 
-    private func complete() {
+    private func complete(_ how: Completion) {
         lock.lock()
         guard !finished else { lock.unlock(); return }
         finished = true
+        completion = how
+        completedAt = DispatchTime.now()
         let pending = waiters
         waiters = []
         lock.unlock()
@@ -243,6 +265,7 @@ private final class LocaleSession: @unchecked Sendable {
     func waitForFinal(timeout: TimeInterval) async -> Transcript? {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             lock.lock()
+            if waitStartedAt == nil { waitStartedAt = DispatchTime.now() }
             if finished {
                 lock.unlock()
                 cont.resume()
@@ -251,12 +274,32 @@ private final class LocaleSession: @unchecked Sendable {
             waiters.append(cont)
             lock.unlock()
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
-                self?.complete()
+                self?.complete(.timeout)
             }
         }
         let result = getLatestResult()
         guard let result else { return nil }
-        return Self.transcript(from: result, locale: locale)
+        return annotate(Self.transcript(from: result, locale: locale))
+    }
+
+    private func annotate(_ t: Transcript) -> Transcript {
+        var t = t
+        lock.lock()
+        t.timedOut = completion == .timeout
+        if let start = waitStartedAt, let end = completedAt, end.uptimeNanoseconds >= start.uptimeNanoseconds {
+            t.latencyMs = Int((end.uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
+        }
+        lock.unlock()
+        t.onDevice = onDevice
+        return t
+    }
+
+    /// Diagnostics record for this locale, including empty/errored results.
+    func diagnosticsRecord() -> [String: Any] {
+        lock.lock(); let err = errorText; lock.unlock()
+        let base = getLatestResult().map { Self.transcript(from: $0, locale: locale) }
+            ?? Transcript(text: "", confidence: nil, language: locale, durationMs: nil, provider: "apple", isFinal: false)
+        return annotate(base).diagnosticsRecord(error: err)
     }
 
     static func transcript(from result: SFSpeechRecognitionResult, locale: String) -> Transcript {

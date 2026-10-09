@@ -219,6 +219,7 @@ export class AgentRuntime {
     }
 
     const processed = processTranscript(transcript);
+    options.onTranscriptProcessed?.(processed);
 
     console.log(`\n[NORMALIZED]`);
     console.log(`"${processed.normalizedTranscript}"`);
@@ -320,6 +321,11 @@ export class AgentRuntime {
       toolDomain: routeResult.toolDomain,
       routerDurationMs,
       toolCallCount: routeResult.toolCalls?.length || 0,
+    });
+    options.onRoute?.({
+      matched: routeResult.matched,
+      toolDomain: routeResult.toolDomain,
+      tools: (routeResult.toolCalls ?? []).map((tc) => tc.name),
     });
 
     if (routeResult.matched) {

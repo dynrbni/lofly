@@ -63,6 +63,15 @@ public struct STTConfig {
 
     /// Opt-in diagnostics (timings, formats, raw + final transcripts).
     public var debug = false
+    /// Opt-in per-utterance diagnostics record (every engine's transcript,
+    /// confidence, timings, noise floor, clipping) sent to the agent, which
+    /// appends it to ~/.lofly/stt/diagnostics.jsonl.
+    public var diagnostics = false
+    /// With `diagnostics`: also keep each utterance's 16 kHz WAV in
+    /// ~/.lofly/stt/audio/ to build a correction dataset.
+    public var saveAudio = false
+    /// Saved WAVs beyond this count are deleted, oldest first.
+    public var maxSavedAudioFiles = 500
 
     public static func load() -> STTConfig {
         var c = STTConfig()
@@ -88,6 +97,9 @@ public struct STTConfig {
         c.cloudFinalPass = r.bool("cloudFinalPass", c.cloudFinalPass)
         c.cloudTimeoutSeconds = r.double("cloudTimeoutSeconds", c.cloudTimeoutSeconds)
         c.debug = r.bool("debug", c.debug)
+        c.diagnostics = r.bool("diagnostics", c.diagnostics)
+        c.saveAudio = r.bool("saveAudio", c.saveAudio)
+        c.maxSavedAudioFiles = Int(r.double("maxSavedAudioFiles", Double(c.maxSavedAudioFiles)))
         return c
     }
 
@@ -135,6 +147,11 @@ public struct Transcript {
     public var lowConfidenceWords: [String] = []
     /// Whether this is the provider's final hypothesis (vs. a timed-out partial).
     public var isFinal: Bool = true
+    /// Diagnostics: the final result never arrived before the timeout.
+    public var timedOut: Bool = false
+    /// Diagnostics: end of audio → result.
+    public var latencyMs: Int?
+    public var onDevice: Bool?
 
     public var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
@@ -145,6 +162,18 @@ public struct Transcript {
         if let language { m["language"] = language }
         if let durationMs { m["durationMs"] = durationMs }
         if !lowConfidenceWords.isEmpty { m["lowConfidenceWords"] = lowConfidenceWords }
+        return m
+    }
+
+    /// Shape of `SttEngineResult` in packages/core/src/stt/diagnostics.ts.
+    func diagnosticsRecord(error: String? = nil) -> [String: Any] {
+        var m: [String: Any] = ["engine": provider, "text": text, "isFinal": isFinal, "timedOut": timedOut]
+        if let language { m["locale"] = language }
+        if let confidence { m["confidence"] = confidence }
+        if let latencyMs { m["latencyMs"] = latencyMs }
+        if let onDevice { m["onDevice"] = onDevice }
+        if !lowConfidenceWords.isEmpty { m["lowConfidenceWords"] = lowConfidenceWords }
+        if let error { m["error"] = error }
         return m
     }
 }

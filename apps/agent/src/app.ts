@@ -29,6 +29,11 @@ import {
   humanizeToolName,
   capabilityLabel,
   firstSentence,
+  SttDiagnosticsStore,
+  parseUtteranceDiagnostics,
+  buildSttReport,
+  formatSttReport,
+  type OutcomeDiagnostics,
 } from '@lofly/core';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -66,6 +71,7 @@ export interface LoflyAppOptions {
   activity?: ActivityLog;
   settings?: SettingsStore;
   account?: AccountStore;
+  sttDiagnostics?: SttDiagnosticsStore;
 }
 
 export class LoflyAgentApp {
@@ -84,6 +90,8 @@ export class LoflyAgentApp {
   public activity: ActivityLog;
   public settings: SettingsStore;
   public account: AccountStore;
+  /** Opt-in per-utterance STT diagnostics (written only when the app asks). */
+  public sttDiagnostics: SttDiagnosticsStore;
 
   private currentConversationId: string | null = null;
   private currentTaskId: string | null = null;
@@ -133,6 +141,7 @@ export class LoflyAgentApp {
     this.activity = options.activity || new ActivityLog();
     this.settings = options.settings || new SettingsStore();
     this.account = options.account || new AccountStore();
+    this.sttDiagnostics = options.sttDiagnostics || new SttDiagnosticsStore();
 
     // 6. Create HTTP & WebSocket Servers
     // Every request must be answered. The route handlers below return early, so
@@ -534,6 +543,7 @@ export class LoflyAgentApp {
           : (typeof body.sessionId === 'string' && body.sessionId.trim().length > 0)
             ? body.sessionId.trim()
             : undefined;
+        const sttDiagnostics = source === 'voice' && body.sttDiagnostics === true;
 
         const isStream = Boolean(body.stream) || req.headers.accept?.includes('text/event-stream');
         const requestId = `chat_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
@@ -563,6 +573,7 @@ export class LoflyAgentApp {
                 attachments,
                 conversationId: conversationIdParam,
                 voiceSessionId,
+                sttDiagnostics,
                 onChunk: (chunk: string) => {
                   if (!clientAborted) {
                     res.write(`data: ${JSON.stringify({ type: 'chunk', text: chunk, requestId })}\n\n`);
@@ -598,7 +609,7 @@ export class LoflyAgentApp {
         const { result, taskId, conversationId } = await this.runTracked(
           fullQuery,
           requestId,
-          { source, reasoningLevel, attachments, conversationId: conversationIdParam, voiceSessionId }
+          { source, reasoningLevel, attachments, conversationId: conversationIdParam, voiceSessionId, sttDiagnostics }
         );
         sendJson(200, { ...result, taskId, conversationId });
       } catch (err) {
@@ -715,6 +726,30 @@ export class LoflyAgentApp {
           'manchild', 'Radiohead', 'Creep', 'Bruno Mars', 'Taylor Swift', 'Billie Eilish', 'Dongker'
         ],
       });
+      return;
+    }
+
+    // 7c. POST /stt/diagnostics (opt-in per-utterance record from the app)
+    if (req.method === 'POST' && pathname === '/stt/diagnostics') {
+      const record = parseUtteranceDiagnostics(await readBody());
+      if (!record) {
+        sendJson(400, { error: 'Invalid utterance diagnostics record.' });
+        return;
+      }
+      this.recordSttDiagnostics(record);
+      sendJson(200, { success: true });
+      return;
+    }
+
+    // 7d. GET /stt/diagnostics/report ("why did it miss" summary)
+    if (req.method === 'GET' && pathname === '/stt/diagnostics/report') {
+      const report = buildSttReport(this.sttDiagnostics.readAll());
+      if (url.searchParams.get('format') === 'text') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(formatSttReport(report));
+        return;
+      }
+      sendJson(200, report);
       return;
     }
 
@@ -1027,6 +1062,15 @@ export class LoflyAgentApp {
    * history — voice is transient, history is what the user typed.
    * Used by both POST /query and POST /audio so voice and text share one path.
    */
+  /** Diagnostics are best-effort: a disk error must never fail a command. */
+  private recordSttDiagnostics(record: Parameters<SttDiagnosticsStore['append']>[0]): void {
+    try {
+      this.sttDiagnostics.append(record);
+    } catch (err) {
+      this.logger.warn(`STT diagnostics write failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   private async runTracked(
     text: string,
     requestId: string,
@@ -1037,6 +1081,8 @@ export class LoflyAgentApp {
       conversationId?: string;
       voiceSessionId?: string;
       onChunk?: (chunk: string) => void;
+      /** The app opted in to STT diagnostics for this voice query. */
+      sttDiagnostics?: boolean;
     } = {}
   ): Promise<{ result: AgentRunResult; conversationId: string | null; taskId: string }> {
     const persistToConversation = options.source !== 'voice';
@@ -1059,6 +1105,19 @@ export class LoflyAgentApp {
     this.currentTaskId = taskId;
     this.tasks.start(taskId, conversationId ?? 'voice', text.slice(0, 60));
 
+    const diag: OutcomeDiagnostics | null =
+      options.sttDiagnostics && options.voiceSessionId
+        ? {
+            kind: 'outcome',
+            sessionId: options.voiceSessionId,
+            ts: Date.now(),
+            rawTranscript: text,
+            normalizedTranscript: text,
+            isValid: true,
+            corrections: [],
+          }
+        : null;
+
     try {
       const result = await this.runtime.handleTranscript(text, {
         requestId,
@@ -1066,7 +1125,27 @@ export class LoflyAgentApp {
         reasoningLevel: options.reasoningLevel,
         attachments: options.attachments,
         onChunk: options.onChunk,
+        onTranscriptProcessed: diag
+          ? (p) => {
+              diag.normalizedTranscript = p.normalizedTranscript;
+              diag.isValid = p.isValid;
+              diag.validationReason = p.validationReason;
+              diag.corrections = p.corrections.map((c) => ({ from: c.from, to: c.to, reason: c.reason }));
+            }
+          : undefined,
+        onRoute: diag
+          ? (r) => {
+              diag.routeMatched = r.matched;
+              diag.routeDomain = r.toolDomain;
+              diag.routeTools = r.tools;
+            }
+          : undefined,
       });
+
+      if (diag) {
+        diag.error = result.error;
+        this.recordSttDiagnostics(diag);
+      }
 
       const outcome =
         result.error === 'cancelled' ? 'cancelled' : result.completed ? 'completed' : 'failed';

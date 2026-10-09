@@ -309,6 +309,10 @@ export interface AgentRunOptions {
   attachments?: string[];
   onChunk?: (chunk: string) => void;
   signal?: AbortSignal;
+  /** Observes the fast-router decision (STT diagnostics). */
+  onRoute?: (route: { matched: boolean; toolDomain?: string; tools: string[] }) => void;
+  /** Observes transcript validation/normalization of voice input (STT diagnostics). */
+  onTranscriptProcessed?: (processed: ProcessedTranscript) => void;
 }
 
 export interface AgentRunResult {
